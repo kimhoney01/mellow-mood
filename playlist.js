@@ -73,37 +73,6 @@ function showShareNote(message) {
   shareNote.textContent = message;
 }
 
-function shareRecord(playlist) {
-  return {
-    title: playlist.title || "",
-    titleColor: playlist.titleColor || "#4B342C",
-    banner: playlist.banner || null,
-    page: playlist.page || null,
-    tagColor: playlist.tagColor || "#FFEEF3",
-    tags: playlist.tags || [],
-    trackColor: playlist.trackColor || "#FFFFFF",
-    tracks: (playlist.tracks || []).map((track) => ({
-      title: String(track.title || ""),
-      url: String(track.url || ""),
-    })),
-    stickers: playlist.stickers || [],
-  };
-}
-
-function bytesToBase64Url(bytes) {
-  const chunkSize = 0x8000;
-  let binary = "";
-  for (let index = 0; index < bytes.length; index += chunkSize) {
-    const chunk = bytes.subarray(index, index + chunkSize);
-    let piece = "";
-    for (let offset = 0; offset < chunk.length; offset += 1) {
-      piece += String.fromCharCode(chunk[offset]);
-    }
-    binary += piece;
-  }
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-
 function base64UrlToBytes(value) {
   const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
   const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
@@ -113,28 +82,6 @@ function base64UrlToBytes(value) {
     bytes[index] = binary.charCodeAt(index);
   }
   return bytes;
-}
-
-function concatBytes(parts) {
-  const total = parts.reduce((sum, part) => sum + part.length, 0);
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  parts.forEach((part) => {
-    bytes.set(part, offset);
-    offset += part.length;
-  });
-  return bytes;
-}
-
-function uint32Bytes(value) {
-  const bytes = new Uint8Array(4);
-  new DataView(bytes.buffer).setUint32(0, value);
-  return bytes;
-}
-
-async function gzipBytes(bytes) {
-  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
 async function gunzipBytes(bytes) {
@@ -161,15 +108,6 @@ function bytesToDataUrl(bytes) {
     binary += String.fromCharCode(bytes[index]);
   }
   return `data:${imageMime(bytes)};base64,${btoa(binary)}`;
-}
-
-async function encodePackedShare(meta, images) {
-  const json = new TextEncoder().encode(JSON.stringify(meta));
-  const parts = [new Uint8Array([2]), uint32Bytes(json.length), json];
-  images.forEach((image) => {
-    parts.push(uint32Bytes(image.length), image);
-  });
-  return bytesToBase64Url(await gzipBytes(concatBytes(parts)));
 }
 
 function unpackShare(bytes) {
@@ -268,90 +206,345 @@ function loadImage(src) {
   });
 }
 
-async function compactImageBytes(src, maxEdge, quality) {
-  const image = await loadImage(src);
-  const longest = Math.max(image.width, image.height);
-  const scale = longest > maxEdge ? maxEdge / longest : 1;
+function roundRect(context, x, y, width, height, radius) {
+  const curve = Math.min(radius, width / 2, height / 2);
+  context.beginPath();
+  context.moveTo(x + curve, y);
+  context.arcTo(x + width, y, x + width, y + height, curve);
+  context.arcTo(x + width, y + height, x, y + height, curve);
+  context.arcTo(x, y + height, x, y, curve);
+  context.arcTo(x, y, x + width, y, curve);
+  context.closePath();
+}
+
+function wrapText(context, text, maxWidth) {
+  const lines = [];
+  let line = "";
+  Array.from(String(text || "")).forEach((glyph) => {
+    const next = line + glyph;
+    if (line && context.measureText(next).width > maxWidth) {
+      lines.push(line);
+      line = glyph.trim() ? glyph : "";
+      return;
+    }
+    line = next;
+  });
+  if (line || !lines.length) {
+    lines.push(line);
+  }
+  return lines;
+}
+
+function fitText(context, text, maxWidth) {
+  const glyphs = Array.from(String(text || ""));
+  let label = glyphs.join("");
+  if (context.measureText(label).width <= maxWidth) {
+    return label;
+  }
+  while (glyphs.length && context.measureText(`${glyphs.join("")}…`).width > maxWidth) {
+    glyphs.pop();
+  }
+  return `${glyphs.join("")}…`;
+}
+
+async function optionalImage(src) {
+  if (!src) {
+    return null;
+  }
+  try {
+    return await loadImage(src);
+  } catch {
+    return null;
+  }
+}
+
+function drawCover(context, image, x, y, width, height) {
+  const scale = Math.max(width / image.width, height / image.height);
+  const drawWidth = image.width * scale;
+  const drawHeight = image.height * scale;
+  context.save();
+  context.beginPath();
+  context.rect(x, y, width, height);
+  context.clip();
+  context.drawImage(image, x + (width - drawWidth) / 2, y + (height - drawHeight) / 2, drawWidth, drawHeight);
+  context.restore();
+}
+
+function drawGrid(context, width, height) {
+  context.save();
+  context.strokeStyle = "#ffeef3";
+  context.lineWidth = 1;
+  context.setLineDash([4, 4]);
+  for (let x = 0.5; x < width; x += 28) {
+    context.beginPath();
+    context.moveTo(x, 0);
+    context.lineTo(x, height);
+    context.stroke();
+  }
+  for (let y = 0.5; y < height; y += 28) {
+    context.beginPath();
+    context.moveTo(0, y);
+    context.lineTo(width, y);
+    context.stroke();
+  }
+  context.restore();
+}
+
+async function drawPlaylist(playlist) {
+  const pageWidth = 980;
+  const margin = 36;
+  const frameWidth = pageWidth - margin * 2;
+  const innerWidth = frameWidth - 4 - 56;
+  const measure = document.createElement("canvas").getContext("2d");
+  measure.font = '600 40px "Noto Serif KR", serif';
+  const titleLines = wrapText(measure, playlist.title || "플레이리스트 제목", innerWidth - 48);
+  const bannerHeight = Math.max(168, titleLines.length * 48 + 48);
+
+  measure.font = '16px "Noto Serif KR", serif';
+  const tags = (playlist.tags || []).map((tag) => ({
+    text: String(tag),
+    width: Math.min(innerWidth, measure.measureText(String(tag)).width + 28),
+    height: 36,
+  }));
+  const tagRows = [];
+  tags.forEach((tag) => {
+    const row = tagRows[tagRows.length - 1];
+    if (!row || row.width + 8 + tag.width > innerWidth) {
+      tagRows.push({ width: tag.width, items: [tag] });
+      return;
+    }
+    row.width += 8 + tag.width;
+    row.items.push(tag);
+  });
+  const tagsHeight = tagRows.length ? tagRows.length * 36 + (tagRows.length - 1) * 8 : 0;
+
+  const tracks = (playlist.tracks || []).filter((track) => track.url).map((track) => {
+    const label = fitText(measure, track.title || track.url, innerWidth - 28);
+    return {
+      title: label,
+      url: track.url,
+      width: Math.min(innerWidth, measure.measureText(label).width + 28),
+      height: 48,
+    };
+  });
+  const tracksHeight = tracks.length ? tracks.length * 48 + (tracks.length - 1) * 8 : 0;
+  const contentHeight = bannerHeight
+    + (tagsHeight ? 18 + tagsHeight : 0)
+    + (tracksHeight ? 18 + tracksHeight : 0);
+  const frameHeight = contentHeight + 60;
+  const pageHeight = frameHeight + margin * 2;
+
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(1, Math.round(image.width * scale));
-  canvas.height = Math.max(1, Math.round(image.height * scale));
+  const scale = 2;
+  canvas.width = pageWidth * scale;
+  canvas.height = pageHeight * scale;
   const context = canvas.getContext("2d");
-  context.imageSmoothingEnabled = true;
-  context.imageSmoothingQuality = "high";
-  context.drawImage(image, 0, 0, canvas.width, canvas.height);
-  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", quality));
+  context.scale(scale, scale);
+  context.textBaseline = "top";
+
+  const pageImage = playlist.page && playlist.page.kind !== "color" ? await optionalImage(playlist.page.value) : null;
+  if (pageImage) {
+    drawCover(context, pageImage, 0, 0, pageWidth, pageHeight);
+  } else {
+    context.fillStyle = (playlist.page && playlist.page.value) || "#ffffff";
+    context.fillRect(0, 0, pageWidth, pageHeight);
+  }
+  drawGrid(context, pageWidth, pageHeight);
+
+  const frameX = margin;
+  const frameY = margin;
+  roundRect(context, frameX, frameY, frameWidth, frameHeight, 16);
+  context.fillStyle = "rgba(255,255,255,0.6)";
+  context.fill();
+  context.lineWidth = 2;
+  context.strokeStyle = "#c3d8b2";
+  context.stroke();
+
+  const contentX = frameX + 30;
+  let cursorY = frameY + 30;
+  const bannerImage = playlist.banner && playlist.banner.kind !== "color" ? await optionalImage(playlist.banner.value) : null;
+  if (bannerImage) {
+    drawCover(context, bannerImage, contentX, cursorY, innerWidth, bannerHeight);
+  } else {
+    context.fillStyle = (playlist.banner && playlist.banner.value) || "#ffeef3";
+    context.fillRect(contentX, cursorY, innerWidth, bannerHeight);
+  }
+  context.font = '600 40px "Noto Serif KR", serif';
+  context.fillStyle = playlist.titleColor || "#4b342c";
+  titleLines.forEach((line, index) => {
+    context.fillText(line, contentX + 24, cursorY + bannerHeight - 24 - (titleLines.length - index) * 48);
+  });
+
+  cursorY += bannerHeight;
+  if (tagRows.length) {
+    cursorY += 18;
+    context.font = '16px "Noto Serif KR", serif';
+    context.fillStyle = playlist.tagColor || "#ffeef3";
+    const ink = readableInk(playlist.tagColor || "#ffeef3");
+    tagRows.forEach((row) => {
+      let chipX = contentX;
+      row.items.forEach((tag) => {
+        roundRect(context, chipX, cursorY, tag.width, tag.height, 14);
+        context.fillStyle = playlist.tagColor || "#ffeef3";
+        context.fill();
+        context.fillStyle = ink;
+        context.fillText(tag.text, chipX + 14, cursorY + 8);
+        chipX += tag.width + 8;
+      });
+      cursorY += 44;
+    });
+    cursorY -= 8;
+  }
+
+  const links = [];
+  if (tracks.length) {
+    cursorY += 18;
+    context.font = '16px "Noto Serif KR", serif';
+    const fill = playlist.trackColor || "#ffffff";
+    const ink = readableInk(fill);
+    tracks.forEach((track) => {
+      roundRect(context, contentX, cursorY, track.width, track.height, 16);
+      context.fillStyle = fill;
+      context.fill();
+      context.lineWidth = 2;
+      context.strokeStyle = "#c3d8b2";
+      context.stroke();
+      context.fillStyle = ink;
+      context.fillText(track.title, contentX + 16, cursorY + 14);
+      links.push({
+        x: contentX,
+        y: cursorY,
+        width: track.width,
+        height: track.height,
+        url: track.url,
+      });
+      cursorY += 56;
+    });
+  }
+
+  const layerWidth = frameWidth - 4;
+  const layerHeight = frameHeight - 4;
+  const stickerImages = await Promise.all((playlist.stickers || []).map(async (sticker) => ({
+    sticker,
+    image: await optionalImage(sticker.src),
+  })));
+  stickerImages.forEach(({ sticker, image }) => {
+    if (!image) {
+      return;
+    }
+    const width = (Number(sticker.width) || 22) / 100 * layerWidth;
+    const height = width * (image.height / image.width);
+    const x = frameX + 2 + (Number(sticker.x) || 0) / 100 * layerWidth;
+    const y = frameY + 2 + (Number(sticker.y) || 0) / 100 * layerHeight;
+    context.drawImage(image, x, y, width, height);
+  });
+
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
   if (!blob) {
-    throw new Error("image");
+    throw new Error("pdf");
   }
-  return new Uint8Array(await blob.arrayBuffer());
+  return {
+    jpeg: new Uint8Array(await blob.arrayBuffer()),
+    width: pageWidth,
+    height: pageHeight,
+    pixelWidth: canvas.width,
+    pixelHeight: canvas.height,
+    links,
+  };
 }
 
-async function shareToken(playlist, step) {
-  const images = [];
-  const storeImage = async (src, maxEdge) => {
-    if (!String(src || "").startsWith("data:")) {
-      return src;
-    }
-    images.push(await compactImageBytes(src, maxEdge, step.quality));
-    return images.length - 1;
-  };
-  const storeSurface = async (surface, maxEdge) => {
-    if (!surface || surface.kind === "color" || !surface.value) {
-      return surface;
-    }
-    return { ...surface, value: await storeImage(surface.value, maxEdge) };
-  };
-  const meta = {
-    ...shareRecord(playlist),
-    banner: await storeSurface(playlist.banner, step.surface),
-    page: await storeSurface(playlist.page, step.surface),
-    stickers: await Promise.all((playlist.stickers || []).map(async (sticker) => ({
-      x: sticker.x,
-      y: sticker.y,
-      width: sticker.width,
-      locked: Boolean(sticker.locked),
-      src: await storeImage(sticker.src, step.sticker),
-    }))),
-  };
-  return encodePackedShare(meta, images);
+function pdfString(value) {
+  return String(value).replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
 }
 
-async function copyShareLink(playlist) {
-  const steps = [
-    { sticker: 240, surface: 640, quality: 0.46 },
-    { sticker: 160, surface: 420, quality: 0.34 },
-    { sticker: 112, surface: 300, quality: 0.26 },
-    { sticker: 80, surface: 220, quality: 0.2 },
+function buildPdf({ jpeg, width, height, pixelWidth, pixelHeight, links }) {
+  const encoder = new TextEncoder();
+  const content = `q\n${width} 0 0 ${height} 0 0 cm\n/Im0 Do\nQ\n`;
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R /Annots [${links.map((_, index) => `${6 + index} 0 R`).join(" ")}] >>`,
+    null,
+    `<< /Length ${encoder.encode(content).length} >>\nstream\n${content}endstream`,
+    ...links.map((link) => {
+      const bottom = height - (link.y + link.height);
+      return `<< /Type /Annot /Subtype /Link /Rect [${link.x} ${bottom} ${link.x + link.width} ${height - link.y}] /Border [0 0 0] /A << /S /URI /URI (${pdfString(link.url)}) >> >>`;
+    }),
   ];
-  const limit = 8000;
-  let token = "";
-  for (const step of steps) {
-    token = await shareToken(playlist, step);
-    if (location.origin.length + location.pathname.length + token.length + 3 <= limit) {
-      break;
+  const imageHeader = encoder.encode(`<< /Type /XObject /Subtype /Image /Width ${pixelWidth} /Height ${pixelHeight} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpeg.length} >>\nstream\n`);
+  const imageEnd = encoder.encode("\nendstream");
+
+  const parts = [];
+  let offset = 0;
+  const append = (bytes) => {
+    parts.push(bytes);
+    offset += bytes.length;
+  };
+  append(encoder.encode("%PDF-1.4\n"));
+  const xref = [0];
+  objects.forEach((object, index) => {
+    xref.push(offset);
+    append(encoder.encode(`${index + 1} 0 obj\n`));
+    if (index === 3) {
+      append(imageHeader);
+      append(jpeg);
+      append(imageEnd);
+    } else {
+      append(encoder.encode(object));
     }
+    append(encoder.encode("\nendobj\n"));
+  });
+  const xrefStart = offset;
+  let table = `xref\n0 ${xref.length}\n0000000000 65535 f \n`;
+  for (let index = 1; index < xref.length; index += 1) {
+    table += `${String(xref[index]).padStart(10, "0")} 00000 n \n`;
   }
-  const url = new URL(location.pathname, location.origin);
-  url.hash = `s=${token}`;
-  if (url.href.length > limit) {
-    showShareNote("이미지가 커서 공유 링크를 만들 수 없어요.");
-    return;
-  }
-  await navigator.clipboard.writeText(url.href);
-  shareButton.textContent = "복사됨";
+  table += `trailer\n<< /Size ${xref.length} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+  append(encoder.encode(table));
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const bytes = new Uint8Array(total);
+  let cursor = 0;
+  parts.forEach((part) => {
+    bytes.set(part, cursor);
+    cursor += part.length;
+  });
+  return bytes;
+}
+
+function pdfFileName(title) {
+  const safe = String(title || "playlist").replace(/[\\/:*?"<>|]/g, " ").trim() || "playlist";
+  return `${safe}.pdf`;
+}
+
+async function downloadPlaylistPdf(playlist) {
+  await document.fonts.load('600 40px "Noto Serif KR"');
+  await document.fonts.load('16px "Noto Serif KR"');
+  const page = await drawPlaylist(playlist);
+  const bytes = buildPdf(page);
+  const blob = new Blob([bytes], { type: "application/pdf" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = pdfFileName(playlist.title);
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+  shareButton.textContent = "완료";
   showShareNote("");
   window.setTimeout(() => {
-    shareButton.textContent = "공유";
+    shareButton.textContent = "PDF";
   }, 1600);
 }
 
 function bindShare(playlist) {
   shareButton.hidden = false;
   shareButton.addEventListener("click", async () => {
+    shareButton.disabled = true;
     try {
-      await copyShareLink(playlist);
+      await downloadPlaylistPdf(playlist);
     } catch {
-      showShareNote("링크를 복사하지 못했어요.");
+      showShareNote("PDF를 만들지 못했어요.");
+    } finally {
+      shareButton.disabled = false;
     }
   });
 }
