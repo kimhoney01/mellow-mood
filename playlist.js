@@ -91,10 +91,15 @@ function shareRecord(playlist) {
 }
 
 function bytesToBase64Url(bytes) {
-  let binary = "";
   const chunkSize = 0x8000;
+  let binary = "";
   for (let index = 0; index < bytes.length; index += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+    const chunk = bytes.subarray(index, index + chunkSize);
+    let piece = "";
+    for (let offset = 0; offset < chunk.length; offset += 1) {
+      piece += String.fromCharCode(chunk[offset]);
+    }
+    binary += piece;
   }
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
@@ -170,11 +175,87 @@ function renderPlaylist(playlist) {
   setupStickerLayer(document.querySelector("#sticker-layer"), playlist.stickers || [], false);
 }
 
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("image"));
+    image.src = src;
+  });
+}
+
+async function compactImageSource(src, maxEdge, quality) {
+  if (!String(src || "").startsWith("data:")) {
+    return src;
+  }
+  try {
+    const image = await loadImage(src);
+    const longest = Math.max(image.width, image.height);
+    const scale = longest > maxEdge ? maxEdge / longest : 1;
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(image.width * scale));
+    canvas.height = Math.max(1, Math.round(image.height * scale));
+    canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", quality));
+    if (!blob) {
+      return src;
+    }
+    const compact = await blobToDataUrl(blob);
+    return compact.length < String(src).length ? compact : src;
+  } catch {
+    return src;
+  }
+}
+
+async function compactSurface(surface, maxEdge, quality) {
+  if (!surface || surface.kind === "color" || !surface.value) {
+    return surface;
+  }
+  return {
+    ...surface,
+    value: await compactImageSource(surface.value, maxEdge, quality),
+  };
+}
+
+async function compactForShare(playlist) {
+  const steps = [
+    { sticker: 480, surface: 1200, quality: 0.72 },
+    { sticker: 320, surface: 800, quality: 0.58 },
+    { sticker: 220, surface: 560, quality: 0.46 },
+  ];
+  let compact = playlist;
+  for (const step of steps) {
+    compact = {
+      ...playlist,
+      banner: await compactSurface(playlist.banner, step.surface, step.quality),
+      page: await compactSurface(playlist.page, step.surface, step.quality),
+      stickers: await Promise.all((playlist.stickers || []).map(async (sticker) => ({
+        ...sticker,
+        src: await compactImageSource(sticker.src, step.sticker, step.quality),
+      }))),
+    };
+    const token = await encodeShare(compact);
+    if (token.length + location.origin.length + location.pathname.length + 3 <= 250000) {
+      return compact;
+    }
+  }
+  return compact;
+}
+
 async function copyShareLink(playlist) {
-  const token = await encodeShare(playlist);
+  const token = await encodeShare(await compactForShare(playlist));
   const url = new URL(location.pathname, location.origin);
   url.hash = `s=${token}`;
-  if (url.href.length > 1500000) {
+  if (url.href.length > 250000) {
     showShareNote("이미지가 커서 공유 링크를 만들 수 없어요.");
     return;
   }
