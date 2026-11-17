@@ -115,23 +115,107 @@ function base64UrlToBytes(value) {
   return bytes;
 }
 
-async function encodeShare(playlist) {
-  const stream = new Blob([JSON.stringify(shareRecord(playlist))])
-    .stream()
-    .pipeThrough(new CompressionStream("gzip"));
-  const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
-  return bytesToBase64Url(bytes);
+function concatBytes(parts) {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  parts.forEach((part) => {
+    bytes.set(part, offset);
+    offset += part.length;
+  });
+  return bytes;
+}
+
+function uint32Bytes(value) {
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, value);
+  return bytes;
+}
+
+async function gzipBytes(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("gzip"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function gunzipBytes(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function imageMime(bytes) {
+  if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) {
+    return "image/webp";
+  }
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) {
+    return "image/jpeg";
+  }
+  if (bytes[0] === 0x89 && bytes[1] === 0x50) {
+    return "image/png";
+  }
+  return "image/webp";
+}
+
+function bytesToDataUrl(bytes) {
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 1) {
+    binary += String.fromCharCode(bytes[index]);
+  }
+  return `data:${imageMime(bytes)};base64,${btoa(binary)}`;
+}
+
+async function encodePackedShare(meta, images) {
+  const json = new TextEncoder().encode(JSON.stringify(meta));
+  const parts = [new Uint8Array([2]), uint32Bytes(json.length), json];
+  images.forEach((image) => {
+    parts.push(uint32Bytes(image.length), image);
+  });
+  return bytesToBase64Url(await gzipBytes(concatBytes(parts)));
+}
+
+function unpackShare(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const jsonLength = view.getUint32(1);
+  let offset = 5;
+  const meta = JSON.parse(new TextDecoder().decode(bytes.subarray(offset, offset + jsonLength)));
+  offset += jsonLength;
+  const images = [];
+  while (offset + 4 <= bytes.length) {
+    const size = view.getUint32(offset);
+    offset += 4;
+    images.push(bytes.subarray(offset, offset + size));
+    offset += size;
+  }
+  const sourceAt = (value) => (typeof value === "number" ? bytesToDataUrl(images[value]) : value);
+  const surface = (value) => {
+    if (!value || value.kind === "color" || typeof value.value !== "number") {
+      return value;
+    }
+    return { ...value, value: sourceAt(value.value) };
+  };
+  return {
+    ...meta,
+    banner: surface(meta.banner),
+    page: surface(meta.page),
+    stickers: (meta.stickers || []).map((sticker) => ({
+      ...sticker,
+      src: sourceAt(sticker.src),
+    })),
+  };
 }
 
 async function decodeShare(token) {
-  const stream = new Blob([base64UrlToBytes(token)])
-    .stream()
-    .pipeThrough(new DecompressionStream("gzip"));
-  const playlist = JSON.parse(await new Response(stream).text());
-  if (!playlist || Array.isArray(playlist)) {
+  const bytes = await gunzipBytes(base64UrlToBytes(token));
+  if (bytes[0] === 123) {
+    const playlist = JSON.parse(new TextDecoder().decode(bytes));
+    if (!playlist || Array.isArray(playlist)) {
+      throw new Error("invalid share");
+    }
+    return playlist;
+  }
+  if (bytes[0] !== 2) {
     throw new Error("invalid share");
   }
-  return playlist;
+  return unpackShare(bytes);
 }
 
 function renderPlaylist(playlist) {
@@ -175,15 +259,6 @@ function renderPlaylist(playlist) {
   setupStickerLayer(document.querySelector("#sticker-layer"), playlist.stickers || [], false);
 }
 
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
-  });
-}
-
 function loadImage(src) {
   return new Promise((resolve, reject) => {
     const image = new Image();
@@ -193,69 +268,72 @@ function loadImage(src) {
   });
 }
 
-async function compactImageSource(src, maxEdge, quality) {
-  if (!String(src || "").startsWith("data:")) {
-    return src;
+async function compactImageBytes(src, maxEdge, quality) {
+  const image = await loadImage(src);
+  const longest = Math.max(image.width, image.height);
+  const scale = longest > maxEdge ? maxEdge / longest : 1;
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(image.width * scale));
+  canvas.height = Math.max(1, Math.round(image.height * scale));
+  const context = canvas.getContext("2d");
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", quality));
+  if (!blob) {
+    throw new Error("image");
   }
-  try {
-    const image = await loadImage(src);
-    const longest = Math.max(image.width, image.height);
-    const scale = longest > maxEdge ? maxEdge / longest : 1;
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.max(1, Math.round(image.width * scale));
-    canvas.height = Math.max(1, Math.round(image.height * scale));
-    canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", quality));
-    if (!blob) {
+  return new Uint8Array(await blob.arrayBuffer());
+}
+
+async function shareToken(playlist, step) {
+  const images = [];
+  const storeImage = async (src, maxEdge) => {
+    if (!String(src || "").startsWith("data:")) {
       return src;
     }
-    const compact = await blobToDataUrl(blob);
-    return compact.length < String(src).length ? compact : src;
-  } catch {
-    return src;
-  }
-}
-
-async function compactSurface(surface, maxEdge, quality) {
-  if (!surface || surface.kind === "color" || !surface.value) {
-    return surface;
-  }
-  return {
-    ...surface,
-    value: await compactImageSource(surface.value, maxEdge, quality),
+    images.push(await compactImageBytes(src, maxEdge, step.quality));
+    return images.length - 1;
   };
-}
-
-async function compactForShare(playlist) {
-  const steps = [
-    { sticker: 480, surface: 1200, quality: 0.72 },
-    { sticker: 320, surface: 800, quality: 0.58 },
-    { sticker: 220, surface: 560, quality: 0.46 },
-  ];
-  let compact = playlist;
-  for (const step of steps) {
-    compact = {
-      ...playlist,
-      banner: await compactSurface(playlist.banner, step.surface, step.quality),
-      page: await compactSurface(playlist.page, step.surface, step.quality),
-      stickers: await Promise.all((playlist.stickers || []).map(async (sticker) => ({
-        ...sticker,
-        src: await compactImageSource(sticker.src, step.sticker, step.quality),
-      }))),
-    };
-    const token = await encodeShare(compact);
-    if (token.length + location.origin.length + location.pathname.length + 3 <= 250000) {
-      return compact;
+  const storeSurface = async (surface, maxEdge) => {
+    if (!surface || surface.kind === "color" || !surface.value) {
+      return surface;
     }
-  }
-  return compact;
+    return { ...surface, value: await storeImage(surface.value, maxEdge) };
+  };
+  const meta = {
+    ...shareRecord(playlist),
+    banner: await storeSurface(playlist.banner, step.surface),
+    page: await storeSurface(playlist.page, step.surface),
+    stickers: await Promise.all((playlist.stickers || []).map(async (sticker) => ({
+      x: sticker.x,
+      y: sticker.y,
+      width: sticker.width,
+      locked: Boolean(sticker.locked),
+      src: await storeImage(sticker.src, step.sticker),
+    }))),
+  };
+  return encodePackedShare(meta, images);
 }
 
 async function copyShareLink(playlist) {
-  const token = await encodeShare(await compactForShare(playlist));
+  const steps = [
+    { sticker: 240, surface: 640, quality: 0.46 },
+    { sticker: 160, surface: 420, quality: 0.34 },
+    { sticker: 112, surface: 300, quality: 0.26 },
+    { sticker: 80, surface: 220, quality: 0.2 },
+  ];
+  const limit = 8000;
+  let token = "";
+  for (const step of steps) {
+    token = await shareToken(playlist, step);
+    if (location.origin.length + location.pathname.length + token.length + 3 <= limit) {
+      break;
+    }
+  }
   const url = new URL(location.pathname, location.origin);
   url.hash = `s=${token}`;
-  if (url.href.length > 250000) {
+  if (url.href.length > limit) {
     showShareNote("이미지가 커서 공유 링크를 만들 수 없어요.");
     return;
   }
