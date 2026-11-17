@@ -147,8 +147,6 @@ function renderPlaylist(playlist) {
     tagList.append(item);
   });
 
-  setupStickerLayer(document.querySelector("#sticker-layer"), playlist.stickers || [], false);
-
   trackList.style.setProperty("--track-fill", playlist.trackColor || "#FFFFFF");
   trackList.style.setProperty("--track-ink", readableInk(playlist.trackColor || "#FFFFFF"));
   (playlist.tracks || []).forEach((track) => {
@@ -168,6 +166,8 @@ function renderPlaylist(playlist) {
     trackList.append(item);
     bindMarquee(viewport, label);
   });
+
+  setupStickerLayer(document.querySelector("#sticker-layer"), playlist.stickers || [], false);
 }
 
 async function copyShareLink(playlist) {
